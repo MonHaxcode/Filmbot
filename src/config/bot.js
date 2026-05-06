@@ -543,6 +543,287 @@ export function getRandomColor() {
 }
 
 export default botConfig;
+import discord
+from discord.ext import commands
+from discord import app_commands
+import os
+from dotenv import load_dotenv
+import yt_dlp
+import asyncio
+from datetime import datetime
+
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+# Global variables for streaming
+streaming_sessions = {}
+user_credentials = {}
+
+class FilmBot(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.ydl_opts = {
+            'format': 'best',
+            'noplaylist': True,
+            'quiet': False,
+            'no_warnings': False,
+        }
+
+    @bot.event
+    async def on_ready():
+        print(f'✅ Bot ist online: {bot.user}')
+        try:
+            synced = await bot.tree.sync()
+            print(f'✅ {len(synced)} Slash Commands synchronisiert')
+        except Exception as e:
+            print(f'❌ Fehler beim Synchronisieren: {e}')
+
+    @bot.tree.command(name="film", description="Film Bot Befehle")
+    @app_commands.describe(
+        aktion="Wähle eine Aktion: join, anmelden, play, stop",
+        url="URL des Videos (für play Befehl)",
+        service="Streaming-Dienst: youtube, twitch"
+    )
+    async def film(interaction: discord.Interaction, aktion: str, url: str = None, service: str = None):
+        """Hauptbefehl für den Film Bot"""
+        
+        if aktion.lower() == "join":
+            await film_join(interaction)
+        elif aktion.lower() == "anmelden":
+            await film_anmelden(interaction, service)
+        elif aktion.lower() == "play":
+            await film_play(interaction, url)
+        elif aktion.lower() == "stop":
+            await film_stop(interaction)
+        else:
+            await interaction.response.send_message(
+                "❌ Unbekannte Aktion! Verwende: `join`, `anmelden`, `play` oder `stop`",
+                ephemeral=True
+            )
+
+async def film_join(interaction: discord.Interaction):
+    """Bot tritt dem Voice Channel bei"""
+    try:
+        if not interaction.user.voice:
+            await interaction.response.send_message(
+                "❌ Du musst in einem Voice Channel sein!",
+                ephemeral=True
+            )
+            return
+        
+        channel = interaction.user.voice.channel
+        guild_id = interaction.guild.id
+        
+        # Bot zum Voice Channel hinzufügen
+        voice_client = await channel.connect()
+        streaming_sessions[guild_id] = {
+            'voice_client': voice_client,
+            'channel': channel,
+            'owner': interaction.user.id,
+            'authenticated': False,
+            'service': None
+        }
+        
+        await interaction.response.send_message(
+            f"✅ Bot ist dem Voice Channel `{channel.name}` beigetreten!\n"
+            f"Nutze `/film anmelden` um dich authentifizieren zu können."
+        )
+        print(f"[{datetime.now()}] Bot joined channel: {channel.name} in guild {guild_id}")
+        
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Fehler beim Beitreten: {str(e)}",
+            ephemeral=True
+        )
+        print(f"Fehler in film_join: {e}")
+
+async def film_anmelden(interaction: discord.Interaction, service: str):
+    """Benutzer authentifiziert sich bei einem Streaming-Dienst"""
+    try:
+        guild_id = interaction.guild.id
+        user_id = interaction.user.id
+        
+        if guild_id not in streaming_sessions:
+            await interaction.response.send_message(
+                "❌ Bot ist nicht im Voice Channel! Nutze zuerst `/film join`",
+                ephemeral=True
+            )
+            return
+        
+        session = streaming_sessions[guild_id]
+        
+        if session['owner'] != user_id:
+            await interaction.response.send_message(
+                "❌ Nur der Benutzer, der den Bot eingeladen hat, kann sich anmelden!",
+                ephemeral=True
+            )
+            return
+        
+        if service and service.lower() in ['youtube', 'twitch']:
+            streaming_sessions[guild_id]['authenticated'] = True
+            streaming_sessions[guild_id]['service'] = service.lower()
+            
+            await interaction.response.send_message(
+                f"✅ Du hast dich erfolgreich bei **{service.upper()}** angemeldet!\n"
+                f"Nutze jetzt `/film play <URL>` um einen Stream zu starten.",
+                ephemeral=False
+            )
+            print(f"[{datetime.now()}] User {interaction.user} authenticated with {service}")
+        else:
+            await interaction.response.send_message(
+                "❌ Bitte gib einen gültigen Dienst an: `youtube` oder `twitch`",
+                ephemeral=True
+            )
+            
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Fehler bei der Anmeldung: {str(e)}",
+            ephemeral=True
+        )
+        print(f"Fehler in film_anmelden: {e}")
+
+async def film_play(interaction: discord.Interaction, url: str):
+    """Startet den Stream"""
+    try:
+        await interaction.response.defer()
+        
+        guild_id = interaction.guild.id
+        user_id = interaction.user.id
+        
+        if guild_id not in streaming_sessions:
+            await interaction.followup.send(
+                "❌ Bot ist nicht im Voice Channel! Nutze zuerst `/film join`"
+            )
+            return
+        
+        session = streaming_sessions[guild_id]
+        
+        if session['owner'] != user_id:
+            await interaction.followup.send(
+                "❌ Nur der Benutzer, der den Bot eingeladen hat, kann Streams starten!"
+            )
+            return
+        
+        if not session['authenticated']:
+            await interaction.followup.send(
+                "❌ Du musst dich zuerst anmelden! Nutze `/film anmelden <service>`"
+            )
+            return
+        
+        if not url:
+            await interaction.followup.send(
+                "❌ Bitte gib die URL des Videos ein!"
+            )
+            return
+        
+        # Video-Informationen abrufen
+        await interaction.followup.send(
+            f"⏳ Lade Video... Dies kann eine Weile dauern."
+        )
+        
+        try:
+            with yt_dlp.YoutubeDL(cog.ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'Unbekannter Titel')
+                duration = info.get('duration', 0)
+                
+                # Umrechnung der Dauer in Minuten
+                duration_minutes = duration // 60 if duration else 0
+                
+                await interaction.followup.send(
+                    f"▶️ **Stream gestartet!**\n"
+                    f"🎬 Titel: **{title}**\n"
+                    f"⏱️ Dauer: **{duration_minutes} Minuten**\n"
+                    f"👥 Alle im Voice Channel können den Stream sehen!"
+                )
+                
+                streaming_sessions[guild_id]['current_stream'] = {
+                    'title': title,
+                    'url': url,
+                    'started_at': datetime.now()
+                }
+                
+                print(f"[{datetime.now()}] Stream started: {title}")
+                
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Fehler beim Laden des Videos: {str(e)}\n"
+                f"Bitte überprüfe die URL und versuche es erneut."
+            )
+            print(f"Fehler beim Video-Laden: {e}")
+            
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Fehler beim Starten des Streams: {str(e)}"
+        )
+        print(f"Fehler in film_play: {e}")
+
+async def film_stop(interaction: discord.Interaction):
+    """Stoppt den aktuellen Stream"""
+    try:
+        guild_id = interaction.guild.id
+        user_id = interaction.user.id
+        
+        if guild_id not in streaming_sessions:
+            await interaction.response.send_message(
+                "❌ Bot ist nicht im Voice Channel!",
+                ephemeral=True
+            )
+            return
+        
+        session = streaming_sessions[guild_id]
+        
+        if session['owner'] != user_id:
+            await interaction.response.send_message(
+                "❌ Nur der Benutzer, der den Bot eingeladen hat, kann den Stream stoppen!",
+                ephemeral=True
+            )
+            return
+        
+        if 'current_stream' in session:
+            title = session['current_stream']['title']
+            del session['current_stream']
+            await interaction.response.send_message(
+                f"⏹️ Stream **{title}** wurde gestoppt."
+            )
+            print(f"[{datetime.now()}] Stream stopped: {title}")
+        else:
+            await interaction.response.send_message(
+                "❌ Es läuft aktuell kein Stream!",
+                ephemeral=True
+            )
+            
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Fehler beim Stoppen des Streams: {str(e)}",
+            ephemeral=True
+        )
+        print(f"Fehler in film_stop: {e}")
+
+# Cog laden
+async def setup():
+    cog = FilmBot(bot)
+    await bot.add_cog(cog)
+
+# Bot starten
+async def main():
+    async with bot:
+        await setup()
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ FEHLER: Discord Token nicht gefunden! Bitte .env Datei überprüfen.")
+    else:
+        asyncio.run(main())
+
 
 
 
